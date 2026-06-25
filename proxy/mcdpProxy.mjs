@@ -93,6 +93,22 @@ function signMgwHeaders(headers, body, config) {
   return signedHeaders;
 }
 
+function errorPayload(error, extra = {}) {
+  return {
+    success: false,
+    ...extra,
+    message: error.message,
+    code: error.code || error.cause?.code || "",
+    cause: error.cause?.message || ""
+  };
+}
+
+function writeJSON(res, status, payload) {
+  setCors(res);
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+  res.end(JSON.stringify(payload, null, 2));
+}
+
 async function proxyRequest(req, res, targetURL, config, options = {}) {
   if (req.method === "OPTIONS") {
     setCors(res);
@@ -101,15 +117,24 @@ async function proxyRequest(req, res, targetURL, config, options = {}) {
     return;
   }
 
+  if (typeof fetch !== "function") {
+    throw new Error("Node.js global fetch is not available. Please use Node.js 18 or newer.");
+  }
+
   const body = ["GET", "HEAD"].includes(req.method || "") ? undefined : await readRequestBody(req);
   const headers = options.signReport
     ? signMgwHeaders(forwardHeaders(req), body, config)
     : forwardHeaders(req);
-  const upstreamResponse = await fetch(targetURL, {
-    method: req.method,
-    headers,
-    body
-  });
+  let upstreamResponse;
+  try {
+    upstreamResponse = await fetch(targetURL, {
+      method: req.method,
+      headers,
+      body
+    });
+  } catch (error) {
+    throw new Error(`Proxy request to ${targetURL} failed: ${error.message}`, { cause: error });
+  }
   const responseBody = Buffer.from(await upstreamResponse.arrayBuffer());
   const contentType = upstreamResponse.headers.get("content-type") || "application/json; charset=utf-8";
   const diagnosticHeaders = [
@@ -137,19 +162,63 @@ async function proxyRequest(req, res, targetURL, config, options = {}) {
   res.end(responseBody);
 }
 
+async function testConnection(res, config) {
+  const startedAt = Date.now();
+  if (typeof fetch !== "function") {
+    writeJSON(res, 500, {
+      success: false,
+      reportURL: config.reportURL,
+      nodeVersion: process.version,
+      fetchAvailable: false,
+      message: "Node.js global fetch is not available. Please use Node.js 18 or newer."
+    });
+    return;
+  }
+
+  try {
+    const upstreamResponse = await fetch(config.reportURL, {
+      method: "GET",
+      headers: { "Cache-Control": "no-store" }
+    });
+    writeJSON(res, 200, {
+      success: true,
+      reportURL: config.reportURL,
+      upstreamStatus: upstreamResponse.status,
+      resultStatus: upstreamResponse.headers.get("result-status") || "",
+      contentType: upstreamResponse.headers.get("content-type") || "",
+      elapsedMs: Date.now() - startedAt
+    });
+  } catch (error) {
+    writeJSON(res, 500, errorPayload(error, {
+      reportURL: config.reportURL,
+      nodeVersion: process.version,
+      fetchAvailable: true,
+      elapsedMs: Date.now() - startedAt
+    }));
+  }
+}
+
 export async function handleMcdpProxyRequest(req, res, configInput = {}) {
   const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
   const config = resolveProxyConfig(configInput);
 
   if (requestUrl.pathname === "/api/mcdp-proxy-status") {
-    setCors(res);
-    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
-    res.end(JSON.stringify({
+    writeJSON(res, 200, {
       reportURL: config.reportURL,
       uploadURL: config.uploadURL,
       tenantId: config.tenantId,
-      proxySigning: Boolean(config.appSecret)
-    }));
+      proxySigning: Boolean(config.appSecret),
+      nodeVersion: process.version,
+      fetchAvailable: typeof fetch === "function",
+      httpProxyConfigured: Boolean(process.env.HTTP_PROXY || process.env.http_proxy),
+      httpsProxyConfigured: Boolean(process.env.HTTPS_PROXY || process.env.https_proxy),
+      extraCaConfigured: Boolean(process.env.NODE_EXTRA_CA_CERTS)
+    });
+    return true;
+  }
+
+  if (requestUrl.pathname === "/api/mcdp-connection-test") {
+    await testConnection(res, config);
     return true;
   }
 
