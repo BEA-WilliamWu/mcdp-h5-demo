@@ -24,6 +24,20 @@ const mimeTypes = {
   ".ico": "image/x-icon"
 };
 
+function serverErrorPayload(error) {
+  return {
+    success: false,
+    message: error.message,
+    code: error.code || error.cause?.code || "",
+    cause: error.cause?.message || "",
+    causeCode: error.cause?.code || error.cause?.cause?.code || "",
+    nodeVersion: process.version,
+    httpProxyConfigured: Boolean(process.env.HTTP_PROXY || process.env.http_proxy),
+    httpsProxyConfigured: Boolean(process.env.HTTPS_PROXY || process.env.https_proxy),
+    extraCaConfigured: Boolean(process.env.NODE_EXTRA_CA_CERTS)
+  };
+}
+
 async function serveStatic(req, res, requestUrl) {
   let pathname = decodeURIComponent(requestUrl.pathname);
   if (pathname === "/" || pathname === "/mcdp-h5-demo/") {
@@ -78,7 +92,7 @@ createServer(async function (req, res) {
   } catch (error) {
     setCors(res);
     res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify({ success: false, message: error.message }));
+    res.end(JSON.stringify(serverErrorPayload(error), null, 2));
   }
 }).listen(port, function () {
   console.log(`MCDP H5 Vue demo: http://localhost:${port}/`);

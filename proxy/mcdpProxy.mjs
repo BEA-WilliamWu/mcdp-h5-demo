@@ -1,6 +1,9 @@
 import { createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { join } from "node:path";
+import { connect as tlsConnect } from "node:tls";
 
 const DEFAULT_REPORT_URL = "https://mgw.mpaas.cn-hongkong.aliyuncs.com/mgw.htm";
 const DEFAULT_UPLOAD_URL = "https://mdap.mpaas.cn-hongkong.aliyuncs.com";
@@ -51,7 +54,7 @@ export function setCors(res) {
 function forwardHeaders(req) {
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
-    if (["host", "origin", "referer", "connection", "content-length"].includes(key.toLowerCase())) {
+    if (["host", "origin", "referer", "connection", "content-length", "accept-encoding"].includes(key.toLowerCase())) {
       continue;
     }
     headers[key] = value;
@@ -109,6 +112,147 @@ function writeJSON(res, status, payload) {
   res.end(JSON.stringify(payload, null, 2));
 }
 
+function getProxyURL(targetURL) {
+  const parsed = new URL(targetURL);
+  if (parsed.protocol === "https:") {
+    return process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || "";
+  }
+  if (parsed.protocol === "http:") {
+    return process.env.HTTP_PROXY || process.env.http_proxy || "";
+  }
+  return "";
+}
+
+function describeProxyURL(proxyURLString) {
+  if (!proxyURLString) {
+    return "";
+  }
+  try {
+    const proxyURL = new URL(proxyURLString);
+    return `${proxyURL.protocol}//${proxyURL.hostname}${proxyURL.port ? `:${proxyURL.port}` : ""}`;
+  } catch (error) {
+    return "invalid proxy URL";
+  }
+}
+
+function proxyAuthHeader(proxyURL) {
+  if (!proxyURL.username && !proxyURL.password) {
+    return "";
+  }
+  const username = decodeURIComponent(proxyURL.username || "");
+  const password = decodeURIComponent(proxyURL.password || "");
+  return `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`;
+}
+
+function normalizeResponseHeaders(headers) {
+  const normalized = {};
+  for (const [key, value] of Object.entries(headers)) {
+    normalized[key.toLowerCase()] = Array.isArray(value) ? value.join(", ") : value || "";
+  }
+  return {
+    get(name) {
+      return normalized[name.toLowerCase()] || null;
+    }
+  };
+}
+
+function requestWithHttpProxy(targetURL, method, headers, body, proxyURLString) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(targetURL);
+    const proxyURL = new URL(proxyURLString);
+    if (proxyURL.protocol !== "http:") {
+      reject(new Error(`Only http:// proxy URLs are supported by this demo server. Current proxy: ${proxyURL.protocol}`));
+      return;
+    }
+
+    const targetPort = target.port || "443";
+    const targetHost = `${target.hostname}:${targetPort}`;
+    const connectHeaders = { Host: targetHost };
+    const proxyAuth = proxyAuthHeader(proxyURL);
+    if (proxyAuth) {
+      connectHeaders["Proxy-Authorization"] = proxyAuth;
+    }
+
+    const connectReq = httpRequest({
+      hostname: proxyURL.hostname,
+      port: proxyURL.port || 80,
+      method: "CONNECT",
+      path: targetHost,
+      headers: connectHeaders,
+      timeout: 30000
+    });
+
+    connectReq.once("connect", (connectRes, socket) => {
+      if (connectRes.statusCode !== 200) {
+        socket.destroy();
+        reject(new Error(`HTTP proxy CONNECT failed with status ${connectRes.statusCode || "unknown"}`));
+        return;
+      }
+
+      const tlsSocket = tlsConnect({ socket, servername: target.hostname });
+      tlsSocket.once("secureConnect", () => {
+        const requestHeaders = { ...headers };
+        if (body && !requestHeaders["content-length"] && !requestHeaders["Content-Length"]) {
+          requestHeaders["Content-Length"] = String(body.length);
+        }
+
+        const upstreamReq = httpsRequest({
+          hostname: target.hostname,
+          port: targetPort,
+          path: `${target.pathname}${target.search}`,
+          method,
+          headers: requestHeaders,
+          createConnection: () => tlsSocket,
+          timeout: 30000
+        }, (upstreamRes) => {
+          const chunks = [];
+          upstreamRes.on("data", (chunk) => chunks.push(chunk));
+          upstreamRes.on("end", () => {
+            resolve({
+              status: upstreamRes.statusCode || 502,
+              headers: normalizeResponseHeaders(upstreamRes.headers),
+              body: Buffer.concat(chunks)
+            });
+          });
+        });
+
+        upstreamReq.once("timeout", () => upstreamReq.destroy(new Error(`Proxy request to ${targetURL} timed out`)));
+        upstreamReq.once("error", reject);
+        if (body) {
+          upstreamReq.write(body);
+        }
+        upstreamReq.end();
+      });
+      tlsSocket.once("error", reject);
+    });
+
+    connectReq.once("timeout", () => connectReq.destroy(new Error(`HTTP proxy CONNECT to ${targetHost} timed out`)));
+    connectReq.once("error", reject);
+    connectReq.end();
+  });
+}
+
+async function requestWithFetch(targetURL, method, headers, body) {
+  const upstreamResponse = await fetch(targetURL, {
+    method,
+    headers,
+    body
+  });
+  return {
+    status: upstreamResponse.status,
+    headers: upstreamResponse.headers,
+    body: Buffer.from(await upstreamResponse.arrayBuffer())
+  };
+}
+
+async function sendUpstreamRequest(targetURL, method, headers, body) {
+  const proxyURL = getProxyURL(targetURL);
+  if (proxyURL) {
+    return requestWithHttpProxy(targetURL, method, headers, body, proxyURL);
+  }
+  return requestWithFetch(targetURL, method, headers, body);
+}
+
 async function proxyRequest(req, res, targetURL, config, options = {}) {
   if (req.method === "OPTIONS") {
     setCors(res);
@@ -121,21 +265,18 @@ async function proxyRequest(req, res, targetURL, config, options = {}) {
     throw new Error("Node.js global fetch is not available. Please use Node.js 18 or newer.");
   }
 
-  const body = ["GET", "HEAD"].includes(req.method || "") ? undefined : await readRequestBody(req);
+  const method = req.method || "GET";
+  const body = ["GET", "HEAD"].includes(method) ? undefined : await readRequestBody(req);
   const headers = options.signReport
     ? signMgwHeaders(forwardHeaders(req), body, config)
     : forwardHeaders(req);
   let upstreamResponse;
   try {
-    upstreamResponse = await fetch(targetURL, {
-      method: req.method,
-      headers,
-      body
-    });
+    upstreamResponse = await sendUpstreamRequest(targetURL, method, headers, body);
   } catch (error) {
     throw new Error(`Proxy request to ${targetURL} failed: ${error.message}`, { cause: error });
   }
-  const responseBody = Buffer.from(await upstreamResponse.arrayBuffer());
+  const responseBody = upstreamResponse.body;
   const contentType = upstreamResponse.headers.get("content-type") || "application/json; charset=utf-8";
   const diagnosticHeaders = [
     "result-status",
@@ -164,7 +305,8 @@ async function proxyRequest(req, res, targetURL, config, options = {}) {
 
 async function testConnection(res, config) {
   const startedAt = Date.now();
-  if (typeof fetch !== "function") {
+  const proxyURL = getProxyURL(config.reportURL);
+  if (!proxyURL && typeof fetch !== "function") {
     writeJSON(res, 500, {
       success: false,
       reportURL: config.reportURL,
@@ -176,13 +318,12 @@ async function testConnection(res, config) {
   }
 
   try {
-    const upstreamResponse = await fetch(config.reportURL, {
-      method: "GET",
-      headers: { "Cache-Control": "no-store" }
-    });
+    const upstreamResponse = await sendUpstreamRequest(config.reportURL, "GET", { "Cache-Control": "no-store" });
     writeJSON(res, 200, {
       success: true,
       reportURL: config.reportURL,
+      proxyUsed: Boolean(proxyURL),
+      proxyURL: describeProxyURL(proxyURL),
       upstreamStatus: upstreamResponse.status,
       resultStatus: upstreamResponse.headers.get("result-status") || "",
       contentType: upstreamResponse.headers.get("content-type") || "",
@@ -193,6 +334,8 @@ async function testConnection(res, config) {
       reportURL: config.reportURL,
       nodeVersion: process.version,
       fetchAvailable: true,
+      proxyUsed: Boolean(proxyURL),
+      proxyURL: describeProxyURL(proxyURL),
       elapsedMs: Date.now() - startedAt
     }));
   }
@@ -212,6 +355,7 @@ export async function handleMcdpProxyRequest(req, res, configInput = {}) {
       fetchAvailable: typeof fetch === "function",
       httpProxyConfigured: Boolean(process.env.HTTP_PROXY || process.env.http_proxy),
       httpsProxyConfigured: Boolean(process.env.HTTPS_PROXY || process.env.https_proxy),
+      effectiveReportProxy: describeProxyURL(getProxyURL(config.reportURL)),
       extraCaConfigured: Boolean(process.env.NODE_EXTRA_CA_CERTS)
     });
     return true;
