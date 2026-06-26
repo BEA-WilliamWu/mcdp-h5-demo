@@ -174,9 +174,7 @@ function sanitizeMenuResponse (body) {
       const sourcePath = item.path || item.key || item.name || ''
       const routePath = /^https?:\/\//i.test(sourcePath)
         ? sourcePath
-        : normalizeRoutePath(String(sourcePath).startsWith('/')
-          ? sourcePath
-          : `${parentPath}/${sourcePath}`)
+        : normalizeRoutePath(`${parentPath}/${sourcePath}`)
 
       item.path = routePath
       pathById.set(item.id, routePath)

@@ -145,8 +145,12 @@ const ui = reactive({
 const logs = ref([]);
 const mountStatus = ref([]);
 const rotationSlides = ref([]);
+const materialSummary = ref({});
 const activeRotationIndex = ref(0);
 let rotationTimer = 0;
+let renderCheckTimer = 0;
+let renderObserver = null;
+let renderCheckSeriesTimers = [];
 
 const currentScene = computed(() => {
   return placementGroups.find((group) => group.value === config.zoneCategory) || placementGroups[0];
@@ -181,10 +185,40 @@ function appendLog(title, payload) {
   logs.value = logs.value.slice(0, 20);
 }
 
+function escapeHTML(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 function clearRotationTimer() {
   if (rotationTimer) {
     window.clearInterval(rotationTimer);
     rotationTimer = 0;
+  }
+}
+
+function clearRenderCheckTimer() {
+  if (renderCheckTimer) {
+    window.clearTimeout(renderCheckTimer);
+    renderCheckTimer = 0;
+  }
+}
+
+function clearRenderCheckSeries() {
+  for (const timer of renderCheckSeriesTimers) {
+    window.clearTimeout(timer);
+  }
+  renderCheckSeriesTimers = [];
+}
+
+function stopRenderObserver() {
+  if (renderObserver) {
+    renderObserver.disconnect();
+    renderObserver = null;
   }
 }
 
@@ -301,6 +335,7 @@ function buildInitConfig() {
 
 function resetMountPlaceholders() {
   setRotationSlides([]);
+  materialSummary.value = {};
   for (const mount of mountDefs) {
     const node = mountRefs[mount.refName].value;
     if (node) {
@@ -323,10 +358,11 @@ function mountHasMcdpContent(node) {
   if (!node.textContent.trim() && !node.querySelector("img, a, video, canvas, svg")) {
     return false;
   }
-  return !node.querySelector(".slot-placeholder, .notice-placeholder, .inline-placeholder");
+  return !node.querySelector(".slot-placeholder, .notice-placeholder, .inline-placeholder, .empty-mcdp-placeholder");
 }
 
-function inspectRenderedContent() {
+function inspectRenderedContent(options = {}) {
+  renderEmptyMaterialPlaceholders();
   mountStatus.value = mountDefs.map((mount) => {
     const node = mountRefs[mount.refName].value;
     const previewNode = node ? node.cloneNode(true) : null;
@@ -334,19 +370,95 @@ function inspectRenderedContent() {
       previewNode.querySelectorAll("script, style").forEach((item) => item.remove());
     }
     const hasRotationSlides = mount.type === "rotation" && rotationSlides.value.length > 0;
+    const emptyMessage = emptyMaterialMessage(mount);
     return {
       type: mount.type,
       code: config[mount.key],
       rendered: mountHasMcdpContent(node) || hasRotationSlides,
       textPreview: hasRotationSlides
         ? `MCDP 返回 ${rotationSlides.value.length} 张轮播素材`
-        : previewNode ? previewNode.textContent.trim().replace(/\s+/g, " ").slice(0, 120) : ""
+        : emptyMessage || (previewNode ? previewNode.textContent.trim().replace(/\s+/g, " ").slice(0, 120) : "")
     };
   });
-  appendLog("render check", {
-    note: "rendered=true 表示展位容器已经被 MCDP WebSDK 返回内容替换。",
-    mounts: mountStatus.value
+  if (options.log !== false) {
+    appendLog("render check", {
+      reason: options.reason || "manual",
+      note: "rendered=true 表示展位容器已经被 MCDP WebSDK 返回内容替换。",
+      mounts: mountStatus.value
+    });
+  }
+}
+
+function scheduleRenderCheck(delay = 300, options = {}) {
+  clearRenderCheckTimer();
+  renderCheckTimer = window.setTimeout(() => {
+    renderCheckTimer = 0;
+    inspectRenderedContent(options);
+  }, delay);
+}
+
+function scheduleRenderCheckSeries() {
+  clearRenderCheckSeries();
+  const delays = [1200, 3000, 7000, 12000, 20000];
+  renderCheckSeriesTimers = delays.map((delay, index) => window.setTimeout(() => {
+    inspectRenderedContent({
+      log: index === delays.length - 1,
+      reason: `初始化后 ${delay / 1000}s 复查`
+    });
+  }, delay));
+}
+
+function observeRenderMounts() {
+  stopRenderObserver();
+  if (!window.MutationObserver) {
+    return;
+  }
+  renderObserver = new MutationObserver(() => {
+    scheduleRenderCheck(250, {
+      log: false,
+      reason: "展位 DOM 变化"
+    });
   });
+  for (const mount of mountDefs) {
+    const node = mountRefs[mount.refName].value;
+    if (node) {
+      renderObserver.observe(node, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: ["src", "href", "style", "class"]
+      });
+    }
+  }
+}
+
+function emptyMaterialMessage(mount) {
+  const summary = materialSummary.value[mount.type];
+  if (!summary || !summary.found || summary.materialCount > 0) {
+    return "";
+  }
+  return `${summary.code} 返回 0 条素材，检查活动时间、人群命中、素材状态和投放策略。`;
+}
+
+function renderEmptyMaterialPlaceholders() {
+  for (const mount of mountDefs) {
+    const node = mountRefs[mount.refName].value;
+    if (!node || mountHasMcdpContent(node) || (mount.type === "rotation" && rotationSlides.value.length > 0)) {
+      continue;
+    }
+    const message = emptyMaterialMessage(mount);
+    if (!message) {
+      continue;
+    }
+    node.innerHTML = [
+      '<div class="empty-mcdp-placeholder">',
+      `<span>${escapeHTML(mount.label)}</span>`,
+      "<strong>MCDP 未返回素材</strong>",
+      `<p>${escapeHTML(message)}</p>`,
+      "</div>"
+    ].join("");
+  }
 }
 
 function parseMaybeJSON(value) {
@@ -490,9 +602,33 @@ function syncMcdpPayload(body) {
   if (!spaces) {
     return;
   }
+  const summary = {};
+  for (const mount of mountDefs) {
+    const code = config[mount.key];
+    const zone = spaces.find((item) => zoneCodeOf(item) === code || containsValue(item, code));
+    const objects = zone ? findFirstArray(zone, ["spaceObjectList", "objectList", "materialList", "materialInfoList", "items", "list"]) || [] : [];
+    summary[mount.type] = {
+      code,
+      found: Boolean(zone),
+      materialCount: objects.length,
+      displayMaxCount: zone && typeof zone.displayMaxCount !== "undefined" ? zone.displayMaxCount : "",
+      multiStyle: zone ? pickString(zone, ["multiStyle", "style", "type"]) : ""
+    };
+  }
+  materialSummary.value = summary;
+
   const rotationZone = spaces.find((zone) => zoneCodeOf(zone) === config.rotationCode || containsValue(zone, config.rotationCode));
   const slides = rotationZone ? normalizeRotationSlides(rotationZone) : [];
   setRotationSlides(slides);
+  const totalMaterials = Object.values(summary).reduce((total, item) => total + item.materialCount, 0);
+  if (totalMaterials === 0) {
+    ui.gatewayMemo = "MGS 请求成功，但当前展位没有返回素材；通常是活动过期、人群未命中、素材未上线或投放策略未命中。";
+  }
+  scheduleRenderCheck(300, {
+    log: false,
+    reason: "MCDP 返回后复查"
+  });
+  appendLog("MCDP payload summary", summary);
   if (slides.length > 0) {
     appendLog("rotation material sync", {
       code: config.rotationCode,
@@ -638,8 +774,12 @@ function loadSdk() {
 
 async function initMcdp() {
   installGatewayDiagnostics();
+  clearRenderCheckTimer();
+  clearRenderCheckSeries();
+  stopRenderObserver();
   resetMountPlaceholders();
   await nextTick();
+  observeRenderMounts();
 
   const initConfig = buildInitConfig();
   const missing = validateRequired(initConfig);
@@ -667,7 +807,7 @@ async function initMcdp() {
       initConfig: maskConfig(initConfig),
       mountCodes: mountCodeSummary()
     });
-    window.setTimeout(inspectRenderedContent, 3000);
+    scheduleRenderCheckSeries();
   } catch (error) {
     ui.sdkState = "失败";
     appendLog("error", { message: error.message });
@@ -688,6 +828,9 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   clearRotationTimer();
+  clearRenderCheckTimer();
+  clearRenderCheckSeries();
+  stopRenderObserver();
 });
 </script>
 

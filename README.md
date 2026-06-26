@@ -149,3 +149,47 @@ floating_buoy    优惠入口浮标           https://www.bco.com.hk/h5/offers
 - MGS 返回 `7003`：时间戳或签名头格式不符合 MGS 校验，确认代理只发送小写 `ts/sign/signtype/tenantid`。
 - `/mgw.htm` 成功但页面无内容：检查展位码、活动状态、活动时间、人群规则、素材状态和投放策略。
 - 曝光/点击无统计：检查 `/mdap/*` 是否成功转发到 `MCDP_UPLOAD_URL`。
+
+### Windows 上 `/mgw.htm` 返回 500
+
+`/mgw.htm` 是本地 Node 代理转发到阿里 MGS 的接口。500 通常表示 Node 进程没有成功连到 `https://mgw.mpaas.cn-hongkong.aliyuncs.com/mgw.htm`，常见原因是 Node 版本低于 18、BEA 内网阻断外网、公司代理未配置给 Node、或公司根证书没有加入 Node 信任链。
+
+先打开：
+
+```text
+http://localhost:5177/api/mcdp-proxy-status
+http://localhost:5177/api/mcdp-connection-test
+```
+
+再在 PowerShell 执行：
+
+```powershell
+node -v
+node -e "console.log(typeof fetch)"
+curl.exe -I https://mgw.mpaas.cn-hongkong.aliyuncs.com/mgw.htm
+curl.exe -I https://mdap.mpaas.cn-hongkong.aliyuncs.com
+```
+
+判断方式：
+
+- `fetch` 不是 `function`：Node 版本太低，换 Node.js 18 或以上。
+- `api/mcdp-proxy-status` 里 `proxySigning=false`：没有复制 `.env.local`，或没有设置 `MCDP_APP_SECRET`。
+- `curl.exe` 也连不上阿里域名：需要 BEA 网络放通或配置公司代理。
+- `curl.exe` 能连，但 Node 报证书错误：需要用 `NODE_EXTRA_CA_CERTS` 指向公司根证书文件。
+
+如果 BEA 内网必须走 HTTP 代理，可以先在启动服务的同一个 PowerShell 里设置代理，再启动：
+
+```powershell
+$env:HTTPS_PROXY="http://proxy-host:proxy-port"
+$env:HTTP_PROXY="http://proxy-host:proxy-port"
+node server.mjs
+```
+
+如果代理需要账号密码：
+
+```powershell
+$env:HTTPS_PROXY="http://username:password@proxy-host:proxy-port"
+node server.mjs
+```
+
+启动后再次打开 `http://localhost:5177/api/mcdp-proxy-status`，确认 `httpsProxyConfigured=true`，再打开 `http://localhost:5177/api/mcdp-connection-test`，确认 `success=true`。

@@ -103,6 +103,38 @@ button {
   background: #eef5f1;
 }
 
+.empty-mcdp-placeholder {
+  display: grid;
+  min-height: inherit;
+  height: 100%;
+  place-content: center;
+  gap: 8px;
+  padding: 18px;
+  border: 1px dashed #9aa8b8;
+  border-radius: 8px;
+  background: #f7fafc;
+  color: #475569;
+  text-align: center;
+}
+
+.empty-mcdp-placeholder span {
+  color: #0f766e;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.empty-mcdp-placeholder strong {
+  color: #0f172a;
+  font-size: 16px;
+}
+
+.empty-mcdp-placeholder p {
+  max-width: 320px;
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .hero-placement-shell.has-carousel .hero-placement {
   position: absolute;
   inset: 0;
