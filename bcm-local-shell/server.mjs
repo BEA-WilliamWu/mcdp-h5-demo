@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const host = process.env.HOST || '127.0.0.1'
-const port = Number(process.env.PORT || 5173)
+const port = Number(process.env.PORT || 5175)
 const ossHost = 'bcm-pub.oss-cn-hongkong.aliyuncs.com'
 const apiHost = 'c86e660649a94346bb9d00a9e621da5d-cn-hongkong.alicloudapi.com'
 const backendTunnelHost = '127.0.0.1'
@@ -75,7 +75,11 @@ function runtimePatch () {
     };
   }
 })();
-<\\/script>`
+</script>`
+}
+
+function safeScriptJson (value) {
+  return JSON.stringify(value).replace(/<\/script/gi, '<\\/script')
 }
 
 function shellHtml () {
@@ -114,7 +118,7 @@ function shellHtml () {
   <script>
     const OSS_BASE = '/bcm/';
     const OSS_ENTRY = '/bcm/index.html';
-    const RUNTIME_PATCH = ${JSON.stringify(runtimePatch())};
+    const RUNTIME_PATCH = ${safeScriptJson(runtimePatch())};
     const statusEl = document.getElementById('status');
     const errorEl = document.getElementById('error');
     const frameEl = document.getElementById('frame');
@@ -150,9 +154,20 @@ function shellHtml () {
 
     reloadEl.addEventListener('click', loadRemoteApp);
     loadRemoteApp();
-  <\\/script>
+  </script>
 </body>
 </html>`
+}
+
+function transformBcmIndexHtml (html) {
+  const cleaned = html.replace(/<base\b[^>]*>/gi, '')
+  const injected = `<base href="/bcm/">\n${runtimePatch()}`
+
+  if (/<head\b[^>]*>/i.test(cleaned)) {
+    return cleaned.replace(/<head(\s[^>]*)?>/i, match => `${match}\n${injected}`)
+  }
+
+  return `${injected}\n${cleaned}`
 }
 
 function resolve4 (hostname) {
@@ -472,6 +487,24 @@ function sendShell (response) {
   response.end(body)
 }
 
+function sendBcmIndex (response) {
+  const filePath = path.resolve(localDistRoot, 'index.html')
+  if (!fs.existsSync(filePath)) {
+    response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
+    response.end(`Missing local index.html: ${filePath}`)
+    return
+  }
+
+  const body = Buffer.from(transformBcmIndexHtml(fs.readFileSync(filePath, 'utf8')))
+  response.writeHead(200, {
+    'content-type': 'text/html; charset=utf-8',
+    'cache-control': 'no-cache, no-store, must-revalidate',
+    'content-length': String(body.length),
+    'x-bcm-transformed-index': 'true'
+  })
+  response.end(body)
+}
+
 function isPortOpen (targetHost, targetPort) {
   return new Promise(resolve => {
     const socket = net.connect({ host: targetHost, port: targetPort })
@@ -607,6 +640,11 @@ const server = http.createServer((request, response) => {
   const requestUrl = parsed.pathname + parsed.search
 
   if (parsed.pathname === '/' || parsed.pathname === '/index.html') {
+    sendBcmIndex(response)
+    return
+  }
+
+  if (parsed.pathname === '/shell') {
     sendShell(response)
     return
   }
